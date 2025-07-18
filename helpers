@@ -1,0 +1,5 @@
+sudo apt update
+sudo apt install python3-libnvinfer python3-libnvinfer-dev -y
+sudo apt install python3-libnvinfer-plugin
+python3 -c "import tensorrt as trt; print(trt.__version__)"
+
