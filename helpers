@@ -8,6 +8,12 @@ python3 -c "import tensorrt as trt; print(trt.__version__)"
 ls /usr/lib/python3*/dist-packages/tensorrt
 export PYTHONPATH=$PYTHONPATH:/usr/lib/python3.8/dist-packages
 
+trtexec --onnx=model_fp32.onnx \
+        --saveEngine=model_fp16.engine \
+        --fp16 \
+        --shapes=input_0:1x3x224x224,input_1:1x3x224x224 \
+        --workspace=4096
+
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
