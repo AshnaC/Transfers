@@ -1,0 +1,104 @@
+from sklearn.metrics import accuracy_score, f1_score
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import numpy as np
+import torch
+
+
+def evaluate_tensorrt(engine_path, loader):
+    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+    # Load engine
+    with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        engine = runtime.deserialize_cuda_engine(f.read())
+
+    context = engine.create_execution_context()
+
+    # Get one batch to set input/output shapes and allocate buffers
+    all_batches = list(loader)
+    if len(all_batches) == 0:
+        raise ValueError("Loader is empty")
+
+    sample_inputs, sample_labels, _ = all_batches[0]
+    input_0 = sample_inputs[0].cpu().numpy()
+    input_1 = sample_inputs[1].cpu().numpy()
+    batch_size = input_0.shape[0]
+
+    # Set binding shapes for inputs
+    context.set_binding_shape(0, input_0.shape)
+    context.set_binding_shape(1, input_1.shape)
+
+    # Fixed output shape: (batch_size, 1)
+    output_shape = (batch_size, 1)
+    output = np.empty(output_shape, dtype=np.float32)
+
+    # Allocate device buffers
+    d_input_0 = cuda.mem_alloc(input_0.nbytes)
+    d_input_1 = cuda.mem_alloc(input_1.nbytes)
+    d_output = cuda.mem_alloc(output.nbytes)
+
+    bindings = [int(d_input_0), int(d_input_1), int(d_output)]
+    stream = cuda.Stream()
+
+    all_predictions = []
+    all_labels = []
+
+    def infer(i0, i1):
+        cuda.memcpy_htod_async(d_input_0, i0, stream)
+        cuda.memcpy_htod_async(d_input_1, i1, stream)
+        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        stream.synchronize()
+
+    for inputs, labels, _ in all_batches:
+        i0 = inputs[0].cpu().numpy()  # no astype()
+        i1 = inputs[1].cpu().numpy()
+        labels = labels.cpu()
+
+        output = np.empty(output_shape, dtype=np.float32)
+
+        # Copy inputs, run inference
+        cuda.memcpy_htod_async(d_input_0, i0, stream)
+        cuda.memcpy_htod_async(d_input_1, i1, stream)
+        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        cuda.memcpy_dtoh_async(output, d_output, stream)
+        stream.synchronize()
+
+        actual_output = torch.from_numpy(output).float().squeeze(-1)
+        actual_labels = labels.float().squeeze(-1)
+
+        predictions = (actual_output >= 0.5).float()
+        all_predictions.extend(predictions.cpu().numpy())
+        all_labels.extend(actual_labels.cpu().numpy())
+
+    accuracy, f1 = calculate_metrics(all_predictions, all_labels)
+    return accuracy, f1
+
+
+def calculate_metrics(predictions, labels):
+    accuracy = accuracy_score(labels, predictions)
+    f1 = f1_score(labels, predictions, zero_division=0)
+    return round(accuracy, 4), round(f1, 4)
+
+
+def get_trt_inference_results(engine_path, data_loaders):
+    train_loader = data_loaders.train_dataloader
+    train_val_loader = data_loaders.train_val_dataloader
+    val_loader = data_loaders.val_dataloader
+    test_loader = data_loaders.test_dataloader
+
+    train_val_accuracy, train_val_f1 = evaluate_tensorrt(engine_path, train_val_loader)
+    val_accuracy, val_f1 = evaluate_tensorrt(engine_path, val_loader)
+    test_accuracy, test_f1 = evaluate_tensorrt(engine_path, test_loader)
+    train_accuracy, train_f1 = evaluate_tensorrt(engine_path, train_loader)
+
+    train_results = {
+        "train_accuracy": train_accuracy, "train_f1": train_f1,
+        "train_val_accuracy": train_val_accuracy, "train_val_f1": train_val_f1
+    }
+    val_results = {
+        "val_accuracy": val_accuracy, "val_f1": val_f1,
+        "test_accuracy": test_accuracy, "test_f1": test_f1
+    }
+    full_results = {**train_results, **val_results}
+    return full_results
