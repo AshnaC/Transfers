@@ -1,0 +1,151 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+import pycuda.driver as cuda
+import pycuda.autoinit
+import tensorrt as trt
+
+from utils.data.streamer_dataset import StreamingArcDataset
+from utils.data.scaler import MinMaxScaler
+from utils.constants import base_data_folder, data_range
+from utils.data.data_util import get_data_folders
+from utils.file_utils import get_files
+from utils.cuda_helpers import synchronize_cuda
+
+stream_size = 160
+
+
+def measure_pre_process_time(engine_path, normalisers, is_dev):
+    file_streamer = ArcFileStreamer(engine_path, normalisers, is_dev)
+    metrics = file_streamer.stream()
+    return metrics
+
+
+class ArcFileStreamer:
+    def __init__(self, engine_path, normalisers, is_dev):
+        self.stream_dataset = StreamingArcDataset(
+            transform=['fft', 'time'],
+            normalisers=normalisers,
+            sequence_length=640,
+            window_size=5,
+            arc_threshold=0.5,
+        )
+        self.is_dev = is_dev
+        self.file_paths = self.get_file_paths()
+        self.trt_runner = TRTInference(engine_path)
+
+    def get_file_paths(self):
+        data_folders = get_data_folders('val')
+        all_file_paths = []
+        for folder in data_folders:
+            folder_path = os.path.join(base_data_folder, folder)
+            file_paths = get_files(folder_path, '.csv')
+            if self.is_dev:
+                file_paths = [file_paths[0]]
+            all_file_paths.extend(file_paths)
+        return all_file_paths
+
+    def stream(self):
+        preprocessing_time = []
+        inference_time = []
+        total_pipeline_time = []
+
+        for file_path in self.file_paths:
+            df = pd.read_csv(file_path)
+            df['current'] = df['current'].ffill()
+            currents = df['current'].values
+            labels = df['label'].values
+            labels[labels == -1] = 0
+
+            data_category = str(file_path).split('/')[-2].split('.')[0]
+            file_range = data_range[data_category]
+            scaler = MinMaxScaler(file_range['min'], file_range['max'], 0, 10)
+            self.stream_dataset.clear_buffer()
+
+            for i in range(0, len(currents), stream_size):
+                x = currents[i: i + stream_size]
+                y = labels[i: i + stream_size]
+                t1 = time.time()
+                has_required_data = self.stream_dataset.push(x, y)
+                if has_required_data:
+                    (input_tensor0, input_tensor1), _ = self.stream_dataset.process_current_buffer(scaler)
+                    t2 = time.time()
+
+                    np_input0 = (
+                        input_tensor0.detach().cpu().numpy().astype(np.float32)
+                        if hasattr(input_tensor0, "detach") else
+                        np.asarray(input_tensor0, dtype=np.float32)
+                    )
+                    np_input1 = (
+                        input_tensor1.detach().cpu().numpy().astype(np.float32)
+                        if hasattr(input_tensor1, "detach") else
+                        np.asarray(input_tensor1, dtype=np.float32)
+                    )
+
+                    self.trt_runner.run(np_input0, np_input1)
+                    synchronize_cuda()
+
+                    t3 = time.time()
+                    preprocessing_time.append((t2 - t1) * 1000)
+                    inference_time.append((t3 - t2) * 1000)
+                    total_pipeline_time.append((t3 - t1) * 1000)
+
+        return {
+            'preprocessing_avg': round(np.mean(preprocessing_time), 4),
+            'preprocessing_std': round(np.std(preprocessing_time), 4),
+            'inference_avg': round(np.mean(inference_time), 4),
+            'inference_std': round(np.std(inference_time), 4),
+            'pipeline_time_avg': round(np.mean(total_pipeline_time), 4),
+            'pipeline_time_std': round(np.std(total_pipeline_time), 4),
+            'pipeline_counts': len(total_pipeline_time),
+        }
+
+
+class TRTInference:
+    def __init__(self, engine_path):
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f:
+            runtime = trt.Runtime(self.logger)
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+
+        self.context = self.engine.create_execution_context()
+        self.stream = cuda.Stream()
+
+        # Assume binding indices: input0 = 0, input1 = 1, output = 2
+        self.input0_idx = 0
+        self.input1_idx = 1
+        self.output_idx = 2
+
+        self.d_input0 = None
+        self.d_input1 = None
+        self.d_output = None
+        self.output = None
+        self.output_shape = None
+
+    def run(self, np_input0, np_input1):
+        np_input0 = np_input0.astype(np.float32)
+        np_input1 = np_input1.astype(np.float32)
+
+        batch_size = np_input0.shape[0]
+        self.context.set_binding_shape(self.input0_idx, np_input0.shape)
+        self.context.set_binding_shape(self.input1_idx, np_input1.shape)
+
+        output_shape = (batch_size, 1)
+
+        if self.d_input0 is None or self.output_shape != output_shape:
+            self.d_input0 = cuda.mem_alloc(np_input0.nbytes)
+            self.d_input1 = cuda.mem_alloc(np_input1.nbytes)
+            self.output = np.empty(output_shape, dtype=np.float32)
+            self.d_output = cuda.mem_alloc(self.output.nbytes)
+            self.output_shape = output_shape
+
+        bindings = [int(self.d_input0), int(self.d_input1), int(self.d_output)]
+
+        cuda.memcpy_htod_async(self.d_input0, np_input0, self.stream)
+        cuda.memcpy_htod_async(self.d_input1, np_input1, self.stream)
+        self.context.execute_async_v2(bindings=bindings, stream_handle=self.stream.handle)
+        cuda.memcpy_dtoh_async(self.output, self.d_output, self.stream)
+        self.stream.synchronize()
+
+        return self.output
